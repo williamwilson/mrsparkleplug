@@ -1,0 +1,12 @@
+<!-- Define your plugin -->
+<plugin>
+    <name>Mr. Sparkle</name>
+    <version>1.0</version>
+    <author>William Wilson</author>
+    <homePage>http://www.canoesoftware.com</homePage>
+    <email>william@canoesoftware.com</email>
+    <description>A message logging plugin.</description>
+    <class>com.canoesoftware.spark.MrSparklePlugin</class>
+    <minSparkVersion>2.0.0</minSparkVersion>
+</plugin>
+
