@@ -1,19 +1,18 @@
 package com.canoesoftware.spark;
 
-import java.io.File;
-import java.io.FileWriter;
 import java.io.IOException;
 import java.io.OutputStream;
-import java.io.OutputStreamWriter;
-import java.io.Writer;
+import java.io.UnsupportedEncodingException;
 import java.net.HttpURLConnection;
+import java.net.MalformedURLException;
 import java.net.URL;
-import java.net.URLConnection;
 import java.net.URLEncoder;
 import java.text.DateFormat;
+import java.util.ArrayList;
 import java.util.Date;
-import java.util.UUID;
+import java.util.List;
 
+import org.apache.log4j.Logger;
 import org.jivesoftware.smack.packet.Message;
 import org.jivesoftware.smack.util.StringUtils;
 import org.jivesoftware.spark.SessionManager;
@@ -24,75 +23,108 @@ import org.jivesoftware.spark.ui.MessageFilter;
 public class LoggingMessageFilter 
 	implements MessageFilter
 {
-	private static final int MESSAGE_THRESHOLD = 5;
+	/**
+	 * Represents a failed message and associated context.
+	 */
+	private class FailedMessage
+	{
+		private final Message _message;
+		private final ChatRoom _room;
+		private final String _username;
+		
+		/**
+		 * Initializes a new failed message with the specified context.
+		 * @param room the room in which the message was received
+		 * @param username the name of the user who sent the message
+		 * @param message the message
+		 */
+		public FailedMessage(ChatRoom room, String username, Message message)
+		{
+			_room = room;
+			_username = username;
+			_message = message;
+		}
+		/**
+		 * Gets the failed message.
+		 * @return the message which failed to post
+		 */
+		public Message getMessage() { return _message; }
+		
+		/**
+		 * Gets the chatroom in which the message was received.
+		 * @return the chatroom in which the message was received
+		 */
+		public ChatRoom getRoom() { return _room; }
+		
+		/**
+		 * Gets the name of the user who sent the message.
+		 * @return the name of the user who sent the message
+		 */
+		public String getUsername() { return _username; }
+	}
+	
+	private static final int MAX_BUFFER = 50;
+	private static final Logger logger = Logger.getLogger(LoggingMessageFilter.class);
 	
 	private final String _currentUsername;
-	private File _logFile;
-	private Writer _logWriter;
-	private int _messageCount = 0;
-	private final String _path;
-	private final String _publishPath;
+	private final List<FailedMessage> _failedMessages = new ArrayList<FailedMessage>();
+	private final String _logUrl;
 	private final String _room;
 	
 	/**
-	 * Initializes a new MessageFilter for logging messages which stores log files
-	 * temporarily at the specified path.
+	 * Initializes a new MessageFilter for logging messages to a URL via an HTTP post.
 	 * 
 	 * @param room the room for which messages are logged
+	 * @param logUrl the URL to which messages are posted
 	 * 
-	 * @param path the location of temporary log files
-	 * 
-	 * @param publishPath the location to which log files are published
-	 * 
-	 * @throws IOException if unable to create a file for writing at the specified path
 	 */
-	public LoggingMessageFilter(String room, String path, String publishPath) throws IOException
+	public LoggingMessageFilter(String room, String logUrl)
 	{
+		logger.info(String.format("Initializing logging message filter. room: '%s' url: '%s'", room, logUrl));
 		_room = room;
-		_path = path;
-		_publishPath = publishPath;
+		_logUrl = logUrl;
 		
 		/* record the current user's name for logging out-going messages */
 		SessionManager sessionManager = SparkManager.getSessionManager();
 		_currentUsername = sessionManager.getUsername();
-		
-		initializeLogFile();
+		logger.debug(String.format("Current user: '%s'", _currentUsername));
 	}
 
 	public void filterIncoming(ChatRoom room, Message message) {
+		logger.debug(String.format("Incoming message received.  room: '%s'\r\nmessage.id: '%s'\r\nmessage.from: '%s'\r\nmessage.body: '%s'", room.getRoomname(), message.getPacketID(), message.getFrom(), message.getBody()));
 		try {
 			logMessage(room, message);
 		}
 		catch (Exception e)
 		{
+			logger.error(e);
 			e.printStackTrace();
 		}
 	}
 
 	public void filterOutgoing(ChatRoom room, Message message) {
+		logger.debug(String.format("Outgoing message.  room: '%s'\r\nmessage.id: '%s'\r\nmessage.from: '%s'\r\nmessage.body: '%s'", room.getRoomname(), message.getPacketID(), message.getFrom(), message.getBody()));
 		try {
 			logMessage(room, message);
 		}
 		catch (Exception e)
 		{
+			logger.error(e);
 			e.printStackTrace();
 		}
 	}
 	
-	/**
-	 * Initializes a new log file at the current log path.
-	 * @throws IOException if unable to create a file for writing at the current log path
-	 */
-	private void initializeLogFile() throws IOException {
-		UUID uid = UUID.randomUUID();
-		_logFile = new File(_path + "\\" + uid.toString());
-		_logWriter = new FileWriter(_logFile);
-	}
-	
 	private void logMessage(ChatRoom room, Message message) throws Exception
 	{
+		if (message.getPacketID() == null)
+		{
+			logger.debug("Message with null ID ignored.");
+			return;
+		}
+		
 		if (!room.getRoomname().equalsIgnoreCase(_room))
 		{
+			logger.debug("Room match failed, ignoring.");
 			return;
 		}
 		
@@ -109,17 +141,58 @@ public class LoggingMessageFilter
 				username = StringUtils.parseName(message.getFrom());
 			}
 		}
-				
+		logger.debug(String.format("From resolved to: '%s'", username));
+		int status = 0;
 		try {
-			_logWriter.write(message.getPacketID() + ":" + username + ":" + message.getBody() + "\r\n");
-			_logWriter.flush();
-		} catch (IOException e) {
-			e.printStackTrace();
+			status = postMessage(room, message, username);
 		}
+		catch (Exception e) {
+			logger.error(e);
+			logger.debug("Post failed.  Buffering message for retry.");
+			bufferFailedMessage(room, message, username);
+			return;
+		}
+		logger.debug(String.format("Post response: '%s'", status));
 		
-		/* TODO: parameterization and response/error handling */
-		URL sparkleUrl = new URL("http://localhost:2114/message/create");
-		HttpURLConnection connection = (HttpURLConnection)sparkleUrl.openConnection();
+		if (status != 200) {
+			logger.debug("Post failed.  Buffering message for retry.");
+			bufferFailedMessage(room, message, username);
+		}
+		else {
+			while (_failedMessages.size() > 0) {
+				logger.debug("Attempting post for buffered failed message.");
+				FailedMessage failedMessage = _failedMessages.get(0);
+
+				try {
+					status = postMessage(failedMessage.getRoom(), failedMessage.getMessage(), failedMessage.getUsername());
+				}
+				catch (Exception e) {
+					logger.error(e);
+				}
+				
+				logger.debug(String.format("Post response: '%s'", status));
+				if (status != 200) {
+					logger.debug("Post failed.  Aborting re-posts.");
+					break;
+				}
+				_failedMessages.remove(0);
+			}
+		}
+	}
+
+	private void bufferFailedMessage(ChatRoom room, Message message,
+			String username) {
+		_failedMessages.add(new FailedMessage(room, username, message));
+		if (_failedMessages.size() >= MAX_BUFFER) {
+			_failedMessages.remove(0);
+		}
+	}
+
+	private int postMessage(ChatRoom room, Message message, String username)
+			throws MalformedURLException, IOException,
+			UnsupportedEncodingException {
+		URL mrsparkleUrl = new URL(_logUrl);
+		HttpURLConnection connection = (HttpURLConnection)mrsparkleUrl.openConnection();
 		connection.setDoOutput(true);
 		connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
 		
@@ -134,41 +207,9 @@ public class LoggingMessageFilter
 				);
 		output.write(messagePost.getBytes(charset));
 		output.close();
-		
+
+		logger.debug(String.format("Posting to: '%s'\r\n%s", mrsparkleUrl.toString(), messagePost));
 		int status = ((HttpURLConnection)connection).getResponseCode();
-		
-		_messageCount++;
-		if (_messageCount > MESSAGE_THRESHOLD) {
-			publishLog();
-		}
-	}
-	
-	private void publishLog() {
-		File publishPath = new File(_publishPath);
-		if (!publishPath.exists())
-		{
-			if (!publishPath.mkdirs()) {
-				return;
-			}
-		}
-		
-		try {
-			_logWriter.close();
-		} catch (IOException e1) {
-			// TODO Auto-generated catch block
-			e1.printStackTrace();
-		}
-		
-		if (_logFile.renameTo(new File(_publishPath + "\\" + _logFile.getName())))
-		{
-			_messageCount = 0;
-			try {
-				initializeLogFile();
-			}
-			catch (IOException e)
-			{
-				e.printStackTrace();
-			}
-		}		
+		return status;
 	}
 }
