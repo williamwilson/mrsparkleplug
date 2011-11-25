@@ -9,6 +9,7 @@ import java.net.URL;
 import java.net.URLEncoder;
 import java.text.DateFormat;
 import java.util.ArrayList;
+import java.util.Calendar;
 import java.util.Date;
 import java.util.List;
 
@@ -28,6 +29,7 @@ public class LoggingMessageFilter
 	 */
 	private class FailedMessage
 	{
+		private final Date _date;
 		private final Message _message;
 		private final ChatRoom _room;
 		private final String _username;
@@ -37,13 +39,22 @@ public class LoggingMessageFilter
 		 * @param room the room in which the message was received
 		 * @param username the name of the user who sent the message
 		 * @param message the message
+		 * @param date the date and time the message was processed
 		 */
-		public FailedMessage(ChatRoom room, String username, Message message)
+		public FailedMessage(ChatRoom room, String username, Message message, Date date)
 		{
 			_room = room;
 			_username = username;
 			_message = message;
+			_date = date;
 		}
+		
+		/**
+		 * Gets the date and time of the failed message.
+		 * @return the date and time the message was first processed
+		 */
+		public Date getDate() { return _date; }
+		
 		/**
 		 * Gets the failed message.
 		 * @return the message which failed to post
@@ -67,7 +78,8 @@ public class LoggingMessageFilter
 	private static final Logger logger = Logger.getLogger(LoggingMessageFilter.class);
 	
 	private final String _currentUsername;
-	private final List<FailedMessage> _failedMessages = new ArrayList<FailedMessage>();
+	private final List _failedMessages = new ArrayList();
+	private Date _lastMessageTime;
 	private final String _logUrl;
 	private final String _room;
 	
@@ -80,18 +92,18 @@ public class LoggingMessageFilter
 	 */
 	public LoggingMessageFilter(String room, String logUrl)
 	{
-		logger.info(String.format("Initializing logging message filter. room: '%s' url: '%s'", room, logUrl));
+		logger.info(String.format("Initializing logging message filter. room: '%s' url: '%s'", new Object[] {room, logUrl}));
 		_room = room;
 		_logUrl = logUrl;
 		
 		/* record the current user's name for logging out-going messages */
 		SessionManager sessionManager = SparkManager.getSessionManager();
 		_currentUsername = sessionManager.getUsername();
-		logger.debug(String.format("Current user: '%s'", _currentUsername));
+		logger.debug(String.format("Current user: '%s'", new Object[] {_currentUsername}));
 	}
 
 	public void filterIncoming(ChatRoom room, Message message) {
-		logger.debug(String.format("Incoming message received.  room: '%s'\r\nmessage.id: '%s'\r\nmessage.from: '%s'\r\nmessage.body: '%s'", room.getRoomname(), message.getPacketID(), message.getFrom(), message.getBody()));
+		logger.debug(String.format("Incoming message received.  room: '%s'\r\nmessage.id: '%s'\r\nmessage.from: '%s'\r\nmessage.body: '%s'", new Object[] {room.getRoomname(), message.getPacketID(), message.getFrom(), message.getBody()}));
 		try {
 			logMessage(room, message);
 		}
@@ -103,7 +115,7 @@ public class LoggingMessageFilter
 	}
 
 	public void filterOutgoing(ChatRoom room, Message message) {
-		logger.debug(String.format("Outgoing message.  room: '%s'\r\nmessage.id: '%s'\r\nmessage.from: '%s'\r\nmessage.body: '%s'", room.getRoomname(), message.getPacketID(), message.getFrom(), message.getBody()));
+		logger.debug(String.format("Outgoing message.  room: '%s'\r\nmessage.id: '%s'\r\nmessage.from: '%s'\r\nmessage.body: '%s'", new Object[] {room.getRoomname(), message.getPacketID(), message.getFrom(), message.getBody()}));
 		try {
 			logMessage(room, message);
 		}
@@ -141,36 +153,51 @@ public class LoggingMessageFilter
 				username = StringUtils.parseName(message.getFrom());
 			}
 		}
-		logger.debug(String.format("From resolved to: '%s'", username));
+		logger.debug(String.format("From resolved to: '%s'", new Object[] {username}));
 		int status = 0;
+		
+		/* note: in order to avoid multiple messages being sent with the same time
+		 * (and thus losing their ordering) add some time if the current message has
+		 * the same time (this mostly happens when joining a room)
+		 */
+		Date date = new Date();
+		if (_lastMessageTime != null && _lastMessageTime.compareTo(date) >= 0)
+		{
+			Calendar calendar = Calendar.getInstance();
+			calendar.setTime(_lastMessageTime);
+			calendar.add(Calendar.MILLISECOND, 10);
+			date = calendar.getTime();
+		}
+		_lastMessageTime = date;
+		
 		try {
-			status = postMessage(room, message, username);
+			status = postMessage(room, message, username, date);
 		}
 		catch (Exception e) {
 			logger.error(e);
 			logger.debug("Post failed.  Buffering message for retry.");
-			bufferFailedMessage(room, message, username);
+			bufferFailedMessage(room, message, username, date);
 			return;
 		}
-		logger.debug(String.format("Post response: '%s'", status));
+		logger.debug(String.format("Post response: '%s'", new Object[] { new Integer(status)}));
 		
 		if (status != 200) {
 			logger.debug("Post failed.  Buffering message for retry.");
-			bufferFailedMessage(room, message, username);
+			bufferFailedMessage(room, message, username, date);
 		}
 		else {
 			while (_failedMessages.size() > 0) {
 				logger.debug("Attempting post for buffered failed message.");
-				FailedMessage failedMessage = _failedMessages.get(0);
+				FailedMessage failedMessage = (FailedMessage) _failedMessages.get(0);
 
 				try {
-					status = postMessage(failedMessage.getRoom(), failedMessage.getMessage(), failedMessage.getUsername());
+					status = postMessage(failedMessage.getRoom(), failedMessage.getMessage(), failedMessage.getUsername(), failedMessage.getDate());
 				}
 				catch (Exception e) {
 					logger.error(e);
 				}
 				
-				logger.debug(String.format("Post response: '%s'", status));
+				logger.debug(String.format("Post response: '%s'", new Object[] { new Integer(status)}));
 				if (status != 200) {
 					logger.debug("Post failed.  Aborting re-posts.");
 					break;
@@ -181,14 +208,14 @@ public class LoggingMessageFilter
 	}
 
 	private void bufferFailedMessage(ChatRoom room, Message message,
-			String username) {
-		_failedMessages.add(new FailedMessage(room, username, message));
+			String username, Date date) {
+		_failedMessages.add(new FailedMessage(room, username, message, date));
 		if (_failedMessages.size() >= MAX_BUFFER) {
 			_failedMessages.remove(0);
 		}
 	}
 
-	private int postMessage(ChatRoom room, Message message, String username)
+	private int postMessage(ChatRoom room, Message message, String username, Date date)
 			throws MalformedURLException, IOException,
 			UnsupportedEncodingException {
 		URL mrsparkleUrl = new URL(_logUrl);
@@ -199,16 +226,16 @@ public class LoggingMessageFilter
 		OutputStream output = connection.getOutputStream();
 		String charset = "UTF-8";
 		String messagePost = String.format("ID=%s&Room=%s&Body=%s&From=%s&Time=%s",
-				URLEncoder.encode(message.getPacketID(), charset),
+				new Object[] {URLEncoder.encode(message.getPacketID(), charset),
 				URLEncoder.encode(StringUtils.parseName(room.getRoomname()), charset),
 				URLEncoder.encode(message.getBody(), charset),
 				URLEncoder.encode(username, charset),
-				URLEncoder.encode(DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.MEDIUM).format(new Date()), charset)
+				URLEncoder.encode(DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.MEDIUM).format(date), charset)}
 				);
 		output.write(messagePost.getBytes(charset));
 		output.close();
 
-		logger.debug(String.format("Posting to: '%s'\r\n%s", mrsparkleUrl.toString(), messagePost));
+		logger.debug(String.format("Posting to: '%s'\r\n%s", new Object[] {mrsparkleUrl.toString(), messagePost}));
 		int status = ((HttpURLConnection)connection).getResponseCode();
 		return status;
 	}
