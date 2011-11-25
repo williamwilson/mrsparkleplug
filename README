@@ -1,1 +1,5 @@
 mrsparkle logging sparkplug
+
+notes:
+- place jar in spark/plugins
+- place property files (log4j.properties and mrsparkle.properties) in the spark/lib directory
